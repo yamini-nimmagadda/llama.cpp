@@ -499,9 +499,13 @@ std::shared_ptr<ov::Node> GgmlOvDecoder::create_weight_node(ggml_tensor* tensor,
     }
 
     ov::element::Type weight_type;
-    if (tensor->type == GGML_TYPE_Q4_0 || tensor->type == GGML_TYPE_Q4_1 || tensor->type == GGML_TYPE_Q4_K) {
+    if (tensor->type == GGML_TYPE_Q4_0) {
+        weight_type = ov::element::i4;
+    } else if (tensor->type == GGML_TYPE_Q4_1 || tensor->type == GGML_TYPE_Q4_K) {
         weight_type = ov::element::u4;
-    } else {  // tensor.type == GGUF_TYPE_Q8_0 || tensor.type == GGUF_TYPE_Q6_K || tensor.type == GGUF_TYPE_Q5_K
+    } else if (tensor->type == GGML_TYPE_Q8_0) {
+        weight_type = ov::element::i8;
+    } else {  // tensor.type == GGUF_TYPE_Q6_K || tensor.type == GGUF_TYPE_Q5_K
         weight_type = ov::element::u8;
     }
 
@@ -520,30 +524,35 @@ std::shared_ptr<ov::Node> GgmlOvDecoder::create_weight_node(ggml_tensor* tensor,
                     node_shape.back());
 
     ov::Tensor weights(weight_type, node_shape);
-    // For scales and biases
     node_shape[node_shape.size() - 1] = node_shape[node_shape.size() - 1] / weights_per_block;
     ov::Tensor scales(ov::element::f16, node_shape);
-    ov::Tensor biases(ov::element::f16, node_shape);
+
+    ov::Tensor biases;
+    ov::Tensor* bias_ptr = nullptr;
+    if (tensor->type != GGML_TYPE_Q4_0 && tensor->type != GGML_TYPE_Q8_0) {
+        biases = ov::Tensor(ov::element::f16, node_shape);
+        bias_ptr = &biases;
+    }
 
     ov::Output<ov::Node> weight_node;
     if (tensor->type == GGML_TYPE_Q4_0) {
-        extract_q4_0_data(tensor, weights, scales, biases);
-        weight_node = make_int4_weights(weights, scales, biases, weights_per_block);
+        extract_q4_0_data(tensor, weights, scales);
+        weight_node = make_int4_weights(weights, scales, bias_ptr, weights_per_block);
     } else if (tensor->type == GGML_TYPE_Q4_1) {
         extract_q4_1_data(tensor, weights, scales, biases);
-        weight_node = make_int4_weights(weights, scales, biases, weights_per_block);
+        weight_node = make_int4_weights(weights, scales, bias_ptr, weights_per_block);
     } else if (tensor->type == GGML_TYPE_Q8_0) {
-        extract_q8_0_data(tensor, weights, scales, biases);
-        weight_node = make_int8_weights(weights, scales, biases, weights_per_block);
+        extract_q8_0_data(tensor, weights, scales);
+        weight_node = make_int8_weights(weights, scales, bias_ptr, weights_per_block);
     } else if (tensor->type == GGML_TYPE_Q6_K) {
         extract_q6_k_data(tensor, weights, scales, biases);
-        weight_node = make_int8_weights(weights, scales, biases, weights_per_block);
+        weight_node = make_int8_weights(weights, scales, bias_ptr, weights_per_block);
     } else if (tensor->type == GGML_TYPE_Q4_K) {
         extract_q4_k_data(tensor, weights, scales, biases);
-        weight_node = make_int4_weights(weights, scales, biases, weights_per_block);
+        weight_node = make_int4_weights(weights, scales, bias_ptr, weights_per_block);
     } else if (tensor->type == GGML_TYPE_Q5_K) {
         extract_q5_k_data(tensor, weights, scales, biases);
-        weight_node = make_int8_weights(weights, scales, biases, weights_per_block);
+        weight_node = make_int8_weights(weights, scales, bias_ptr, weights_per_block);
     }
 
     OPENVINO_ASSERT(weight_node.get_shape().size() == 2, "Weight should be 2D");

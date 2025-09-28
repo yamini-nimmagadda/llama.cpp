@@ -26,7 +26,6 @@
 #include "ggml-openvino/openvino/node_context.hpp"
 #include "ggml-openvino/openvino/utils.hpp"
 #include "input_model.hpp"
-#include "pass/eliminate_zp.hpp"
 #include "pass/mark_decompression_convert_constant_folding.hpp"
 
 namespace ov {
@@ -233,9 +232,6 @@ std::shared_ptr<Model> TranslateSession::apply_transformations(std::shared_ptr<M
             manager.register_pass<ov::pass::MakeStateful>(kv_param_res_pairs);
         }
 
-        if (ggml_model_decoder->is_static()) {
-            manager.register_pass<pass::EliminateZeroPoints>();
-        }
         manager.run_passes(model);
     }
     return model;

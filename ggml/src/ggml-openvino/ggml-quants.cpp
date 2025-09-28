@@ -28,11 +28,15 @@
 #include "ggml-impl.h"
 #include "ggml.h"
 
-void unpack_32_4(const uint8_t* data, uint8_t* dst) {
+void unpack_32_4(const uint8_t* data, uint8_t* dst, bool to_i4) {
     std::fill_n(dst, 16, 0);
     for (int j = 0; j < 16; ++j) {
         uint8_t x = (data[j] & 0x0F);
         uint8_t y = (data[j] >> 4);
+        if (to_i4) {
+            x = (x - 8) & 0x0F;
+            y = (y - 8) & 0x0F;
+        }
         if (j % 2 != 0) {
             x <<= 4;
             y <<= 4;
@@ -44,20 +48,15 @@ void unpack_32_4(const uint8_t* data, uint8_t* dst) {
 
 // Extracts (weight, scales, biases) from Q4_0 tensors.
 // Data layout is: |16 bit scale|32 x 4bit weights|.
-void extract_q4_0_data(const ggml_tensor* tensor,
-                       ov::Tensor& weights_arr,
-                       ov::Tensor& scales_arr,
-                       ov::Tensor& biases_arr) {
+void extract_q4_0_data(const ggml_tensor* tensor, ov::Tensor& weights_arr, ov::Tensor& scales_arr) {
     const uint64_t bytes_per_block = 18;  // 2 bytes scale, 32x0.5 byte weights
     auto* data = static_cast<uint8_t*>(tensor->data);
     auto* weights = static_cast<uint8_t*>(weights_arr.data());
     auto* scales = scales_arr.data<ov::element_type_traits<ov::element::f16>::value_type>();
-    auto* biases = biases_arr.data<ov::element_type_traits<ov::element::f16>::value_type>();
 
     ov::parallel_for(scales_arr.get_size(), [&](size_t i) {
-        scales[i] = ov::float16::from_bits(*((uint16_t*)(data + i * bytes_per_block)));
-        biases[i] = ov::float16(-8.f * static_cast<float>(scales[i]));
-        unpack_32_4(data + i * bytes_per_block + 2, weights + i * 16);
+        scales[i] = ov::float16::from_bits(*((uint16_t*) (data + i * bytes_per_block)));
+        unpack_32_4(data + i * bytes_per_block + 2, weights + i * 16, true);
     });
 }
 
@@ -81,26 +80,20 @@ void extract_q4_1_data(const ggml_tensor* tensor,
 
 // Extracts (weight, scales, biases) from Q8_0 tensors.
 // Data layout is: |16 bit scale|32 x 8bit weights|.
-void extract_q8_0_data(const ggml_tensor* tensor,
-                       ov::Tensor& weights_arr,
-                       ov::Tensor& scales_arr,
-                       ov::Tensor& biases_arr) {
+void extract_q8_0_data(const ggml_tensor* tensor, ov::Tensor& weights_arr, ov::Tensor& scales_arr) {
     const uint64_t weights_per_block = 32;
     const uint64_t bytes_per_block = 34;  // 2 bytes scale, 32x1 byte weights
-    auto* data = static_cast<uint8_t*>(tensor->data);
-    auto* weights = static_cast<uint8_t*>(weights_arr.data());
+    auto* data = static_cast<int8_t*>(tensor->data);
+    auto* weights = static_cast<int8_t*>(weights_arr.data());
     auto* scales = scales_arr.data<ov::element_type_traits<ov::element::f16>::value_type>();
-    auto* biases = biases_arr.data<ov::element_type_traits<ov::element::f16>::value_type>();
 
     ov::parallel_for(scales_arr.get_size(), [&](size_t i) {
-        uint8_t* block_data = data + i * bytes_per_block;
+        int8_t* block_data = data + i * bytes_per_block;
         scales[i] = ov::float16::from_bits(*(uint16_t*) block_data);
-        biases[i] = ov::float16(-128.f * static_cast<float>(scales[i]));
         for (size_t j = 0; j < weights_per_block; ++j) {
-            uint8_t x = block_data[j + 2];  // j+2 to skip the scale bytes.
-            // Original data is in int8_t, so we add a bias of -128 and invert the first bit.
-            x ^= 1 << 7;
-            weights[i * weights_per_block + j] = x;
+            // Original data is already int8_t
+            // j+2 to skip the scale bytes
+            weights[i * weights_per_block + j] = block_data[j + 2];
         }
     });
 }
@@ -286,7 +279,7 @@ void extract_q5_k_data(const ggml_tensor* tensor, ov::Tensor& weights_arr, ov::T
 
 // TODO Reorder for make_intX_weights
 
-ov::Output<ov::Node> make_int8_weights(ov::Tensor& weight, ov::Tensor& scales, ov::Tensor& biases, size_t group_size) {
+ov::Output<ov::Node> make_int8_weights(ov::Tensor& weight, ov::Tensor& scales, ov::Tensor* biases, size_t group_size) {
     ov::Shape orig_shape = weight.get_shape();
 
     // Expand dimensions for scales and biases
@@ -295,41 +288,44 @@ ov::Output<ov::Node> make_int8_weights(ov::Tensor& weight, ov::Tensor& scales, o
     ov::Shape packed_shape = {orig_shape[0], orig_shape[1] / group_size, group_size};
 
     if (packed_shape[1] == 1) {
+        // Requantized channel-wise case
         packed_shape.erase(packed_shape.begin() + 1);
     } else {
         scale_shape.push_back(1);
         scales.set_shape(scale_shape);
-        biases.set_shape(scale_shape);
+        if (biases != nullptr) {
+            biases->set_shape(scale_shape);
+        }
     }
 
-    // Create graph nodes
+    auto weight_type = biases == nullptr ? ov::element::i8 : ov::element::u8;
     auto weights_node = std::make_shared<ov::op::v0::Constant>(
-        ov::element::u8, packed_shape, static_cast<uint8_t*>(weight.data()), nullptr);
+        weight_type, packed_shape, static_cast<uint8_t*>(weight.data()), nullptr);
     weights_node->get_rt_info()["__gguf_tensor_holder"] = weight;
-    auto scales_f16 = std::make_shared<ov::op::v0::Constant>(scales);
-    ov::Tensor biases_u8(ov::element::u8, scale_shape);
 
     // Calculate zero point
-    const ov::float16* bias_data = biases.data<ov::element_type_traits<ov::element::f16>::value_type>();
-    const ov::float16* scale_data = scales.data<ov::element_type_traits<ov::element::f16>::value_type>();
-    uint8_t* bias_u8_data = biases_u8.data<uint8_t>();
-    for (size_t i = 0; i < biases_u8.get_size(); ++i) {
-        bias_u8_data[i] = (uint8_t)std::round(-1.f * static_cast<float>(bias_data[i]) / static_cast<float>(scale_data[i]));
-    }
-
-    auto zero_point = std::make_shared<ov::op::v0::Constant>(biases_u8);
-    float zp_value;
-    if (ov::op::util::get_single_value(zero_point, zp_value)) {
-        zero_point = ov::op::v0::Constant::create(zero_point->get_element_type(), {}, {zp_value});
+    ov::Output<ov::Node> zero_point;
+    if (biases != nullptr) {
+        const ov::float16* bias_data = biases->data<ov::element_type_traits<ov::element::f16>::value_type>();
+        const ov::float16* scale_data = scales.data<ov::element_type_traits<ov::element::f16>::value_type>();
+        ov::Tensor biases_u8(ov::element::u8, scale_shape);
+        uint8_t* bias_u8_data = biases_u8.data<uint8_t>();
+        for (size_t i = 0; i < biases_u8.get_size(); ++i) {
+            bias_u8_data[i] =
+                (uint8_t) std::round(-1.f * static_cast<float>(bias_data[i]) / static_cast<float>(scale_data[i]));
+        }
+        zero_point = std::make_shared<ov::op::v0::Constant>(biases_u8);
     }
 
     // Quantization operations
     auto weights_f16 = std::make_shared<ov::op::v0::Convert>(weights_node, ov::element::f16);
-    auto zero_point_f16 = std::make_shared<ov::op::v0::Convert>(zero_point, ov::element::f16);
+    auto scales_f16 = std::make_shared<ov::op::v0::Constant>(scales);
+    ov::Output<ov::Node> w_zp = weights_f16;
+    if (biases != nullptr) {
+        auto zero_point_f16 = std::make_shared<ov::op::v0::Convert>(zero_point, ov::element::f16);
+        w_zp = std::make_shared<ov::op::v1::Subtract>(weights_f16, zero_point_f16, ov::op::AutoBroadcastType::NUMPY);
+    }
 
-    auto w_zp = std::make_shared<ov::op::v1::Subtract>(
-        weights_f16, zero_point_f16, ov::op::AutoBroadcastType::NUMPY
-    );
     ov::Output<ov::Node> w_zp_s =
         std::make_shared<ov::op::v1::Multiply>(w_zp, scales_f16, ov::op::AutoBroadcastType::NUMPY);
 
@@ -343,7 +339,7 @@ ov::Output<ov::Node> make_int8_weights(ov::Tensor& weight, ov::Tensor& scales, o
     return std::make_shared<ov::op::v0::Convert>(w_zp_s, ov::element::f32);
 }
 
-ov::Output<ov::Node> make_int4_weights(ov::Tensor& weight, ov::Tensor& scales, ov::Tensor& biases, size_t group_size) {
+ov::Output<ov::Node> make_int4_weights(ov::Tensor& weight, ov::Tensor& scales, ov::Tensor* biases, size_t group_size) {
     ov::Shape orig_weight_shape = weight.get_shape();
 
     // Expand dimensions for scales and biases
@@ -356,42 +352,48 @@ ov::Output<ov::Node> make_int4_weights(ov::Tensor& weight, ov::Tensor& scales, o
         group_size
     };
 
-    // Requantized channel-wise case
     if (packed_shape[1] == 1) {
+        // Requantized channel-wise case
         packed_shape.erase(packed_shape.begin() + 1);
     } else {
         scale_bias_shape.push_back(1);
         scales.set_shape(scale_bias_shape);
-        biases.set_shape(scale_bias_shape);
+        if (biases != nullptr) {
+            biases->set_shape(scale_bias_shape);
+        }
     }
 
-    auto weights_node = std::make_shared<ov::op::v0::Constant>(ov::element::u4, packed_shape, static_cast<uint8_t*>(weight.data()), nullptr);
+    auto weight_type = biases == nullptr ? ov::element::i4 : ov::element::u4;
+    auto weights_node = std::make_shared<ov::op::v0::Constant>(
+        weight_type, packed_shape, static_cast<uint8_t*>(weight.data()), nullptr);
     weights_node->get_rt_info()["__gguf_tensor_holder"] = weight;
-    auto weights_f16 = std::make_shared<ov::op::v0::Convert>(weights_node, ov::element::f16);
 
-    // Pack zero points: two subsequent values into one
-    const ov::float16* bias_data = biases.data<ov::element_type_traits<ov::element::f16>::value_type>();
-    const ov::float16* scale_data = scales.data<ov::element_type_traits<ov::element::f16>::value_type>();
-    ov::Tensor zero_point_tensor(ov::element::u4, scale_bias_shape);
-    uint8_t* zero_point_data = static_cast<uint8_t*>(zero_point_tensor.data());
-    for (size_t i = 0; i < zero_point_tensor.get_byte_size(); ++i) {
-        uint8_t bias1 = (uint8_t)std::round(-1.f * static_cast<float>(bias_data[i * 2]) / static_cast<float>(scale_data[i * 2]));
-        uint8_t bias2 = (uint8_t)std::round(-1.f * static_cast<float>(bias_data[i * 2 + 1]) / static_cast<float>(scale_data[i * 2 + 1]));
-        zero_point_data[i] = (bias2 << 4) | (bias1 & 0x0F);
+    ov::Output<ov::Node> zero_point;
+    if (biases != nullptr) {
+        // Pack zero points: two subsequent values into one
+        const ov::float16* bias_data = biases->data<ov::element_type_traits<ov::element::f16>::value_type>();
+        const ov::float16* scale_data = scales.data<ov::element_type_traits<ov::element::f16>::value_type>();
+        ov::Tensor zero_point_tensor(ov::element::u4, scale_bias_shape);
+        uint8_t* zero_point_data = static_cast<uint8_t*>(zero_point_tensor.data());
+        for (size_t i = 0; i < zero_point_tensor.get_byte_size(); ++i) {
+            uint8_t bias1 = (uint8_t) std::round(-1.f * static_cast<float>(bias_data[i * 2]) /
+                                                 static_cast<float>(scale_data[i * 2]));
+            uint8_t bias2 = (uint8_t) std::round(-1.f * static_cast<float>(bias_data[i * 2 + 1]) /
+                                                 static_cast<float>(scale_data[i * 2 + 1]));
+            zero_point_data[i] = (bias2 << 4) | (bias1 & 0x0F);
+        }
+
+        zero_point = std::make_shared<ov::op::v0::Constant>(zero_point_tensor);
     }
-
-    auto zero_points_node = std::make_shared<ov::op::v0::Constant>(zero_point_tensor);
-    float zp_value;
-    if (ov::op::util::get_single_value(zero_points_node, zp_value)) {
-        zero_points_node = ov::op::v0::Constant::create(zero_points_node->get_element_type(), {}, {zp_value});
-    }
-    auto zero_points_f16 = std::make_shared<ov::op::v0::Convert>(zero_points_node, ov::element::f16);
-
-    auto scales_f16 = std::make_shared<ov::op::v0::Constant>(scales);
 
     // Perform dequantization
-    auto w_zp = std::make_shared<ov::op::v1::Subtract>(
-        weights_f16, zero_points_f16, ov::op::AutoBroadcastType::NUMPY);
+    auto weights_f16 = std::make_shared<ov::op::v0::Convert>(weights_node, ov::element::f16);
+    auto scales_f16 = std::make_shared<ov::op::v0::Constant>(scales);
+    ov::Output<ov::Node> w_zp = weights_f16;
+    if (biases != nullptr) {
+        auto zero_points_f16 = std::make_shared<ov::op::v0::Convert>(zero_point, ov::element::f16);
+        w_zp = std::make_shared<ov::op::v1::Subtract>(weights_f16, zero_points_f16, ov::op::AutoBroadcastType::NUMPY);
+    }
 
     ov::Output<ov::Node> w_zp_s =
         std::make_shared<ov::op::v1::Multiply>(w_zp, scales_f16, ov::op::AutoBroadcastType::NUMPY);
@@ -432,34 +434,37 @@ std::shared_ptr<ov::Node> requantize(const ggml_tensor* tensor, ExtraQuantType r
 
     ov::Tensor weights;
     ov::Tensor scales(ov::element::f16, scales_shape);
-    ov::Tensor bias(ov::element::f16, scales_shape);
+    ov::Tensor bias;
+    ov::Tensor* bias_ptr = nullptr;
+    if (requant_type == ExtraQuantType::Q8_1_C) {
+        bias = ov::Tensor(ov::element::f16, scales_shape);
+        bias_ptr = &bias;
+    }
 
     if (requant_type == ExtraQuantType::Q4_0_C || requant_type == ExtraQuantType::Q4_0_128) {
         weights = ov::Tensor(ov::element::u4, node_shape);
-        quantize_q4_0(weights_f32.data(), weights, scales, bias, weights.get_size(), block_size);
-        weight_node = make_int4_weights(weights, scales, bias, block_size).get_node_shared_ptr();
+        quantize_q4_0(weights_f32.data(), weights, scales, weights.get_size(), block_size);
+        weight_node = make_int4_weights(weights, scales, bias_ptr, block_size).get_node_shared_ptr();
     } else if (requant_type == ExtraQuantType::Q8_1_C) {
         weights = ov::Tensor(ov::element::u8, node_shape);
         quantize_q8_1(weights_f32.data(), weights, scales, bias, weights.get_size(), block_size);
-        weight_node = make_int8_weights(weights, scales, bias, block_size).get_node_shared_ptr();
+        weight_node = make_int8_weights(weights, scales, bias_ptr, block_size).get_node_shared_ptr();
     } else if (requant_type == ExtraQuantType::Q8_0_C || requant_type == ExtraQuantType::Q8_0_32) {
         weights = ov::Tensor(ov::element::u8, node_shape);
-        quantize_q8_0(weights_f32.data(), weights, scales, bias, weights.get_size(), block_size);
-        weight_node = make_int8_weights(weights, scales, bias, block_size).get_node_shared_ptr();
+        quantize_q8_0(weights_f32.data(), weights, scales, weights.get_size(), block_size);
+        weight_node = make_int8_weights(weights, scales, bias_ptr, block_size).get_node_shared_ptr();
     }
 
     weight_node->set_friendly_name(tensor->name);
     return weight_node;
 }
 
-void quantize_q4_0(const float* x, ov::Tensor& weights_arr, ov::Tensor& scales_arr, ov::Tensor& biases_arr, int64_t k,
-                   int64_t qk) {
+void quantize_q4_0(const float* x, ov::Tensor& weights_arr, ov::Tensor& scales_arr, int64_t k, int64_t qk) {
     assert(k % qk == 0);
     const int nb = k / qk;
 
     auto* weights = static_cast<uint8_t*>(weights_arr.data());
     auto* scales = scales_arr.data<ov::element_type_traits<ov::element::f16>::value_type>();
-    auto* biases = biases_arr.data<ov::element_type_traits<ov::element::f16>::value_type>();
     for (int i = 0; i < nb; i++) {
         float amax = 0.0f;  // absolute max
         float max = 0.0f;
@@ -475,7 +480,6 @@ void quantize_q4_0(const float* x, ov::Tensor& weights_arr, ov::Tensor& scales_a
         const float d = max / -8;
         const float id = d ? 1.0f / d : 0.0f;
         scales[i] = ov::float16(d);
-        biases[i] = ov::float16(-8.f * d);
 
         for (int j = 0; j < qk / 2; ++j) {
             const float x0 = x[i * qk + 2 * j] * id;
@@ -487,14 +491,12 @@ void quantize_q4_0(const float* x, ov::Tensor& weights_arr, ov::Tensor& scales_a
     }
 }
 
-void quantize_q8_0(const float* x, ov::Tensor& weights_arr, ov::Tensor& scales_arr, ov::Tensor& biases_arr, int64_t k,
-                   int64_t qk) {
+void quantize_q8_0(const float* x, ov::Tensor& weights_arr, ov::Tensor& scales_arr, int64_t k, int64_t qk) {
     assert(k % qk == 0);
     const int nb = k / qk;
 
     auto* weights = static_cast<uint8_t*>(weights_arr.data());
     auto* scales = scales_arr.data<ov::element_type_traits<ov::element::f16>::value_type>();
-    auto* biases = biases_arr.data<ov::element_type_traits<ov::element::f16>::value_type>();
     for (int i = 0; i < nb; i++) {
         float amax = 0.0f;  // absolute max
 
@@ -508,7 +510,6 @@ void quantize_q8_0(const float* x, ov::Tensor& weights_arr, ov::Tensor& scales_a
         const float d = amax / 127.0f;
         const float id = d ? 1.0f / d : 0.0f;
         scales[i] = ov::float16(d);
-        biases[i] = ov::float16(-128.0f * d);
 
         for (int j = 0; j < qk; ++j) {
             const float x0 = x[i * qk + j] * id;
