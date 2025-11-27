@@ -15,13 +15,14 @@ class GgmlOvDecoder : public ov::frontend::ggml::GgmlDecoder {
 public:
     struct NodeInfo {
         ggml_tensor * node;
+        std::string node_name;
+        std::string node_op_type;
         std::map<std::string, ggml_tensor *> node_inputs;
         std::vector<std::string> node_inputs_names;
-        std::map<std::string, ggml_tensor *> node_outputs;
-        std::vector<std::string> node_outputs_names;
+        ggml_tensor * node_output;
+        std::string node_output_name;
         int node_op_case = 0;
-        std::string node_op_type;
-        std::string node_name;
+        void * data_addr;
     };
     // Graph decoder
     GgmlOvDecoder(ggml_cgraph * cgraph,
@@ -66,7 +67,7 @@ public:
 
     virtual ov::PartialShape get_output_shape(const std::string & name) const override;
 
-    virtual ov::PartialShape get_output_shape(int node_idx, const std::string & name) const override;
+    virtual ov::PartialShape get_output_shape(int node_idx) const override;
 
     virtual std::vector<size_t> get_output_stride(const std::string & name) const override;
 
@@ -78,7 +79,7 @@ public:
 
     virtual int32_t * get_output_op_params(const std::string & name) const override;
 
-    virtual int32_t * get_output_op_params(int node_idx, const std::string & name) const override;
+    virtual int32_t * get_output_op_params(int node_idx) const override;
 
     virtual std::vector<std::string> get_output_names() const override;
 
@@ -116,7 +117,16 @@ public:
         return m_model_weights;
     }
 
-    virtual const std::vector<std::string> & get_model_output_names() const override { return m_model_output_names; }
+    virtual std::vector<std::string> get_model_output_names() const override {
+        std::vector<std::string> output_names;
+        output_names.reserve(m_model_outputs.size());
+        for (const auto & [name, tensor] : m_model_outputs) {
+            output_names.push_back(name);
+        }
+        return output_names;
+    }
+
+    const std::map<std::string, ggml_tensor *> & get_model_outputs() const { return m_model_outputs; }
 
     virtual int get_ctx_size() const { return m_ctx; }
 
@@ -159,12 +169,13 @@ public:
 
     void clear_model_weights() { m_model_weights.clear(); }
 
-private:
-    void set_input_output(ggml_tensor * node, bool naive = false);
-    void add_extra_inputs();
     static std::vector<size_t> get_shape(const ggml_tensor * tensor);
     static std::vector<size_t> get_stride(const ggml_tensor * tensor);
     static ov::element::Type get_ov_type(const ggml_tensor * tensor);
+
+private:
+    void set_input_output(ggml_tensor * node, bool naive = false);
+    void add_extra_inputs();
     int compute_op_case(const ggml_tensor * node);
     std::string compute_op_type(const ggml_tensor * node);
 
@@ -184,7 +195,7 @@ private:
     std::map<std::string, std::shared_ptr<ov::Node>> m_model_extra_inputs;
     std::map<std::string, std::shared_ptr<ov::Tensor>> m_model_extra_input_values;
     std::map<std::string, std::shared_ptr<ov::Node>> m_model_weights;
-    std::vector<std::string> m_model_output_names;
+    std::map<std::string, ggml_tensor *> m_model_outputs;
     std::vector<NodeInfo> m_node_info_list;
 
     // Fixed for a model
